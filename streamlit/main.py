@@ -1,3 +1,4 @@
+import io
 import json
 
 import pandas as pd
@@ -100,10 +101,288 @@ def load_config():
 
 PROTECTED_SCHEMAS = {'OMOP_CDM'}
 
-tab_config, tab_run, tab_history, tab_vocab, tab_coverage, tab_quality, tab_explore = st.tabs([
-    "Configure", "Run", "History",
+tab_docs, tab_config, tab_run, tab_history, tab_vocab, tab_coverage, tab_quality, tab_explore = st.tabs([
+    "📄 Docs", "Configure", "Run", "History",
     "Vocabulary", "Coverage", "Quality", "Explore",
 ])
+
+with tab_docs:
+    st.subheader("Clinical Document Intelligence")
+    st.caption("Upload clinical notes or PDFs → AI extracts structured data → Review & correct → Generate FHIR → Ingest to OMOP")
+
+    DOC_DB = "HEALTHCARE_DOC_AI"
+    DOC_SCHEMA = "DOC_INTELLIGENCE"
+    DOC_STAGE = f"@{DOC_DB}.{DOC_SCHEMA}.RAW_DOCUMENTS"
+
+    doc_tab_upload, doc_tab_review, doc_tab_history = st.tabs(["Upload & Extract", "Review & Correct", "Extraction History"])
+
+    with doc_tab_upload:
+        st.markdown("#### Upload a Clinical Note")
+        upload_method = st.radio("Input method", ["Select existing", "Paste text", "Upload PDF"], horizontal=True, key="doc_input_method")
+
+        note_text = ""
+        if upload_method == "Select existing":
+            try:
+                existing_notes = session.sql(f"""
+                    SELECT note_id, patient_mrn, note_type, department,
+                           LEFT(note_text, 60) || '...' as preview, note_text
+                    FROM {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
+                    ORDER BY created_at DESC
+                """).to_pandas()
+                if not existing_notes.empty:
+                    selected_idx = st.selectbox("Select a note",
+                        range(len(existing_notes)),
+                        format_func=lambda i: f"#{existing_notes.iloc[i]['NOTE_ID']} — {existing_notes.iloc[i]['NOTE_TYPE']} ({existing_notes.iloc[i]['DEPARTMENT']}) — {existing_notes.iloc[i]['PREVIEW']}",
+                        key="doc_existing_select")
+                    note_text = existing_notes.iloc[selected_idx]['NOTE_TEXT']
+                    st.text_area("Note content", value=note_text, height=250, disabled=True, key="doc_existing_preview")
+                else:
+                    st.info("No notes in database yet. Upload or paste one first!")
+            except Exception as e:
+                st.warning(f"Could not load notes: {str(e)[:200]}")
+
+        elif upload_method == "Paste text":
+            note_text = st.text_area("Paste clinical note text", height=250, key="doc_paste_text",
+                placeholder="4mo M s/p CAVC repair POD2, doing well o/n per RN...")
+            note_type = st.selectbox("Note type", ["Progress Note", "Discharge Summary", "H&P", "Clinic Note", "Consult", "Op Note"], key="doc_note_type")
+            note_dept = st.text_input("Department", value="", key="doc_dept", placeholder="e.g., Cardiac ICU, Oncology, NICU")
+
+        if upload_method in ("Select existing", "Paste text") and note_text:
+            if st.button("Extract", key="doc_extract_btn", type="primary"):
+                with st.spinner("Running AI extraction..."):
+                    try:
+                        escaped = note_text.replace("'", "''")
+                        result = session.sql(f"""
+                            SELECT SNOWFLAKE.CORTEX.AI_EXTRACT('{escaped}', OBJECT_CONSTRUCT(
+                                'diagnoses', 'List ONLY actual medical diagnoses or conditions (diseases, syndromes). Include ICD-10 codes if identifiable.',
+                                'medications', 'List each medication with drug name, dose, route, and frequency.',
+                                'lab_values', 'Extract laboratory values with test name, numeric result, and unit.',
+                                'vital_signs', 'Extract vital signs: temperature, heart rate, blood pressure, respiratory rate, SpO2, weight.',
+                                'procedures', 'Any procedures performed or planned.'
+                            ))::STRING as extracted
+                        """).collect()
+                        if result:
+                            extracted = json.loads(result[0]['EXTRACTED'])
+                            resp = extracted.get('response', extracted)
+
+                            st.success("Extraction complete!")
+
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.markdown("**Diagnoses**")
+                                dx = resp.get('diagnoses', [])
+                                if isinstance(dx, list):
+                                    for d in dx:
+                                        st.write(f"• {d}")
+                                elif dx and dx != "None":
+                                    st.write(f"• {dx}")
+                                else:
+                                    st.write("_None identified_")
+
+                                st.markdown("**Medications**")
+                                meds = resp.get('medications', [])
+                                if isinstance(meds, list):
+                                    for m in meds:
+                                        st.write(f"• {m}")
+                                elif meds and meds != "None":
+                                    st.write(f"• {meds}")
+                                else:
+                                    st.write("_None identified_")
+
+                            with col2:
+                                st.markdown("**Vital Signs**")
+                                vitals = resp.get('vital_signs', [])
+                                if isinstance(vitals, list):
+                                    for v in vitals:
+                                        st.write(f"• {v}")
+                                elif vitals and vitals != "None":
+                                    st.write(f"• {vitals}")
+                                else:
+                                    st.write("_None identified_")
+
+                                st.markdown("**Lab Values**")
+                                labs = resp.get('lab_values', [])
+                                if isinstance(labs, list):
+                                    for l in labs:
+                                        st.write(f"• {l}")
+                                elif labs and labs != "None":
+                                    st.write(f"• {labs}")
+                                else:
+                                    st.write("_None identified_")
+
+                                st.markdown("**Procedures**")
+                                procs = resp.get('procedures', [])
+                                if isinstance(procs, list):
+                                    for p in procs:
+                                        st.write(f"• {p}")
+                                elif procs and procs != "None":
+                                    st.write(f"• {procs}")
+                                else:
+                                    st.write("_None identified_")
+
+                            st.markdown("---")
+                            with st.expander("Raw JSON output"):
+                                st.json(resp)
+
+                            resp_json = json.dumps(resp).replace("'", "''")
+                            if upload_method == "Select existing":
+                                session.sql(f"""
+                                    UPDATE {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
+                                    SET extraction_json = PARSE_JSON('{resp_json}'),
+                                        extraction_status = 'EXTRACTED'
+                                    WHERE note_id = {existing_notes.iloc[selected_idx]['NOTE_ID']}
+                                """).collect()
+                                st.success("Extraction saved to note record!")
+                            elif upload_method == "Paste text":
+                                if st.button("Save to database", key="doc_save_btn"):
+                                    session.sql(f"""
+                                        INSERT INTO {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
+                                        (patient_mrn, note_type, note_date, department, author_role, note_text, extraction_json, extraction_status)
+                                        VALUES ('MANUAL-UPLOAD', '{note_type}', CURRENT_DATE(), '{note_dept}', 'Manual Upload', '{escaped}', PARSE_JSON('{resp_json}'), 'EXTRACTED')
+                                    """).collect()
+                                    st.success("Saved to CLINICAL_NOTES table!")
+                    except Exception as e:
+                        st.error(f"Extraction failed: {str(e)[:300]}")
+
+        elif upload_method == "Upload PDF":
+            uploaded_file = st.file_uploader("Upload PDF", type=["pdf"], key="doc_pdf_upload")
+            if uploaded_file:
+                st.info(f"📎 {uploaded_file.name} ({uploaded_file.size / 1024:.1f} KB)")
+                if st.button("Upload & Extract", key="doc_pdf_extract_btn", type="primary"):
+                    with st.spinner("Uploading to stage..."):
+                        try:
+                            file_bytes = io.BytesIO(uploaded_file.getvalue())
+                            session.file.put_stream(
+                                file_bytes,
+                                f"{DOC_STAGE}/{uploaded_file.name}",
+                                auto_compress=False,
+                                overwrite=True,
+                            )
+                            st.success(f"Uploaded to {DOC_STAGE}/{uploaded_file.name}")
+
+                            with st.spinner("Running AI_PARSE_DOCUMENT..."):
+                                parse_result = session.sql(f"""
+                                    SELECT SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(
+                                        BUILD_SCOPED_FILE_URL('{DOC_DB}.{DOC_SCHEMA}.RAW_DOCUMENTS', '{uploaded_file.name}'),
+                                        OBJECT_CONSTRUCT('mode', 'LAYOUT')
+                                    )::STRING as parsed
+                                """).collect()
+                                if parse_result:
+                                    parsed = json.loads(parse_result[0]['PARSED'])
+                                    doc_text = parsed.get('content', parsed.get('text', str(parsed)))
+                                    st.text_area("Extracted text", value=doc_text[:3000], height=200, disabled=True)
+
+                                    with st.spinner("Running AI extraction on parsed text..."):
+                                        escaped_doc = doc_text[:4000].replace("'", "''")
+                                        extract_result = session.sql(f"""
+                                            SELECT SNOWFLAKE.CORTEX.AI_EXTRACT('{escaped_doc}', OBJECT_CONSTRUCT(
+                                                'diagnoses', 'List all medical diagnoses with ICD-10 codes',
+                                                'medications', 'List medications with dose and frequency',
+                                                'vital_signs', 'Extract vital signs with values',
+                                                'procedures', 'Procedures performed or planned'
+                                            ))::STRING as extracted
+                                        """).collect()
+                                        if extract_result:
+                                            extracted = json.loads(extract_result[0]['EXTRACTED'])
+                                            st.json(extracted.get('response', extracted))
+                        except Exception as e:
+                            st.error(f"Error: {str(e)[:300]}")
+
+    with doc_tab_review:
+        st.markdown("#### Review & Correct Extractions")
+        st.caption("Select a note with an existing extraction, review the AI output, correct errors, and save.")
+        try:
+            notes_df = session.sql(f"""
+                SELECT note_id, patient_mrn, note_type, department, extraction_status,
+                       LEFT(note_text, 80) || '...' as preview
+                FROM {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
+                WHERE extraction_status = 'EXTRACTED'
+                ORDER BY created_at DESC
+                LIMIT 20
+            """).to_pandas()
+            if not notes_df.empty:
+                selected_note = st.selectbox("Select note to review",
+                    range(len(notes_df)),
+                    format_func=lambda i: f"#{notes_df.iloc[i]['NOTE_ID']} — {notes_df.iloc[i]['NOTE_TYPE']} ({notes_df.iloc[i]['DEPARTMENT']}) — {notes_df.iloc[i]['PREVIEW']}",
+                    key="doc_review_select")
+
+                note_row = session.sql(f"""
+                    SELECT note_text, extraction_json::STRING as extraction_json
+                    FROM {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
+                    WHERE note_id = {notes_df.iloc[selected_note]['NOTE_ID']}
+                """).collect()
+
+                if note_row and note_row[0]['EXTRACTION_JSON']:
+                    col_note, col_extract = st.columns(2)
+                    with col_note:
+                        st.markdown("**Original Note**")
+                        st.text_area("", value=note_row[0]['NOTE_TEXT'], height=400, disabled=True, key="doc_review_note_text")
+
+                    with col_extract:
+                        st.markdown("**AI Extraction — Edit below to correct**")
+                        extraction = json.loads(note_row[0]['EXTRACTION_JSON'])
+
+                        def list_to_text(val):
+                            if isinstance(val, list):
+                                return "\n".join(str(v) for v in val)
+                            return str(val) if val else ""
+
+                        dx_text = st.text_area("Diagnoses (one per line)", value=list_to_text(extraction.get('diagnoses', [])), height=100, key="doc_review_dx")
+                        meds_text = st.text_area("Medications (one per line)", value=list_to_text(extraction.get('medications', [])), height=100, key="doc_review_meds")
+                        vitals_text = st.text_area("Vital Signs (one per line)", value=list_to_text(extraction.get('vital_signs', [])), height=80, key="doc_review_vitals")
+                        labs_text = st.text_area("Lab Values (one per line)", value=list_to_text(extraction.get('lab_values', [])), height=80, key="doc_review_labs")
+                        procs_text = st.text_area("Procedures (one per line)", value=list_to_text(extraction.get('procedures', [])), height=80, key="doc_review_procs")
+
+                        if st.button("Save Corrections", key="doc_review_save", type="primary"):
+                            corrected = {
+                                "diagnoses": [x.strip() for x in dx_text.split("\n") if x.strip()],
+                                "medications": [x.strip() for x in meds_text.split("\n") if x.strip()],
+                                "vital_signs": [x.strip() for x in vitals_text.split("\n") if x.strip()],
+                                "lab_values": [x.strip() for x in labs_text.split("\n") if x.strip()],
+                                "procedures": [x.strip() for x in procs_text.split("\n") if x.strip()],
+                            }
+                            corrected_json = json.dumps(corrected).replace("'", "''")
+                            session.sql(f"""
+                                UPDATE {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
+                                SET extraction_json = PARSE_JSON('{corrected_json}'),
+                                    extraction_status = 'REVIEWED',
+                                    reviewed_at = CURRENT_TIMESTAMP()
+                                WHERE note_id = {notes_df.iloc[selected_note]['NOTE_ID']}
+                            """).collect()
+                            st.success("Corrections saved!")
+                elif note_row:
+                    st.info("This note hasn't been extracted yet. Go to Upload & Extract → Select existing → Extract first.")
+            else:
+                st.info("No extracted notes to review. Run extraction on some notes first!")
+        except Exception as e:
+            st.warning(f"Could not load notes: {str(e)[:200]}")
+
+    with doc_tab_history:
+        st.markdown("#### Extraction History & Metrics")
+        try:
+            stats = session.sql(f"""
+                SELECT
+                    COUNT(*) as total_notes,
+                    COUNT(DISTINCT department) as departments,
+                    COUNT(DISTINCT note_type) as note_types
+                FROM {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
+            """).collect()
+            if stats:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Notes", stats[0]['TOTAL_NOTES'])
+                c2.metric("Departments", stats[0]['DEPARTMENTS'])
+                c3.metric("Note Types", stats[0]['NOTE_TYPES'])
+
+            by_dept = session.sql(f"""
+                SELECT department, note_type, COUNT(*) as cnt
+                FROM {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
+                GROUP BY department, note_type
+                ORDER BY cnt DESC
+            """).to_pandas()
+            if not by_dept.empty:
+                st.dataframe(by_dept, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Could not load history: {str(e)[:200]}")
 
 with tab_config:
 
