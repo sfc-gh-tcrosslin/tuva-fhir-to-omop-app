@@ -152,76 +152,246 @@ with tab_docs:
                 with st.spinner("Running AI extraction..."):
                     try:
                         escaped = note_text.replace("'", "''")
+                        prompt = f"""Extract ALL clinical observations from this note as structured JSON. For EVERY numeric value mentioned, capture it.
+
+Return JSON with these arrays:
+- "observations": array of {{"name": "human-readable name", "value": numeric_value_or_string, "unit": "unit", "category": "vital-signs|laboratory|social-history"}}
+- "diagnoses": array of {{"name": "diagnosis", "icd10": "code if identifiable"}}
+- "medications": array of {{"drug": "name", "dose": "dose", "route": "route", "frequency": "frequency"}}
+- "procedures": array of strings
+
+Rules:
+- Blood pressure: split into TWO observations (systolic + diastolic)
+- Include ALL numeric values: weights, heights, BMI, gestational age measurements, fetal heart rate, urine dipstick results
+- For qualitative results (e.g., "2+ protein"), use the qualitative value as a string
+- Do NOT skip values just because they appear in flowing text
+- Do NOT invent values not present in the note
+
+Clinical note:
+{escaped}"""
+                        prompt_escaped = prompt.replace("'", "''")
                         result = session.sql(f"""
-                            SELECT SNOWFLAKE.CORTEX.AI_EXTRACT('{escaped}', OBJECT_CONSTRUCT(
-                                'diagnoses', 'List ONLY actual medical diagnoses or conditions (diseases, syndromes). Include ICD-10 codes if identifiable.',
-                                'medications', 'List each medication with drug name, dose, route, and frequency.',
-                                'lab_values', 'Extract laboratory values with test name, numeric result, and unit.',
-                                'vital_signs', 'Extract vital signs: temperature, heart rate, blood pressure, respiratory rate, SpO2, weight.',
-                                'procedures', 'Any procedures performed or planned.'
-                            ))::STRING as extracted
+                            SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{prompt_escaped}')::STRING as extracted
                         """).collect()
                         if result:
-                            extracted = json.loads(result[0]['EXTRACTED'])
-                            resp = extracted.get('response', extracted)
+                            raw = result[0]['EXTRACTED']
+                            try:
+                                resp = json.loads(raw)
+                            except json.JSONDecodeError:
+                                import re
+                                json_match = re.search(r'\{[\s\S]*\}', raw)
+                                resp = json.loads(json_match.group()) if json_match else {"error": "Could not parse"}
 
                             st.success("Extraction complete!")
 
+                            obs = resp.get('observations', [])
+                            dx = resp.get('diagnoses', [])
+                            meds = resp.get('medications', [])
+                            procs = resp.get('procedures', [])
+
                             col1, col2 = st.columns(2)
                             with col1:
-                                st.markdown("**Diagnoses**")
-                                dx = resp.get('diagnoses', [])
-                                if isinstance(dx, list):
-                                    for d in dx:
-                                        st.write(f"• {d}")
-                                elif dx and dx != "None":
-                                    st.write(f"• {dx}")
+                                st.markdown("**Observations (Vitals + Labs)**")
+                                if obs:
+                                    for o in obs:
+                                        val = o.get('value', '')
+                                        unit = o.get('unit', '')
+                                        cat = o.get('category', '')
+                                        st.write(f"• **{o.get('name', '?')}**: {val} {unit} _({cat})_")
                                 else:
                                     st.write("_None identified_")
 
-                                st.markdown("**Medications**")
-                                meds = resp.get('medications', [])
-                                if isinstance(meds, list):
-                                    for m in meds:
-                                        st.write(f"• {m}")
-                                elif meds and meds != "None":
-                                    st.write(f"• {meds}")
+                                st.markdown("**Diagnoses**")
+                                if dx:
+                                    for d in dx:
+                                        icd = f" [{d.get('icd10')}]" if d.get('icd10') else ""
+                                        st.write(f"• {d.get('name', '?')}{icd}")
                                 else:
                                     st.write("_None identified_")
 
                             with col2:
-                                st.markdown("**Vital Signs**")
-                                vitals = resp.get('vital_signs', [])
-                                if isinstance(vitals, list):
-                                    for v in vitals:
-                                        st.write(f"• {v}")
-                                elif vitals and vitals != "None":
-                                    st.write(f"• {vitals}")
-                                else:
-                                    st.write("_None identified_")
-
-                                st.markdown("**Lab Values**")
-                                labs = resp.get('lab_values', [])
-                                if isinstance(labs, list):
-                                    for l in labs:
-                                        st.write(f"• {l}")
-                                elif labs and labs != "None":
-                                    st.write(f"• {labs}")
+                                st.markdown("**Medications**")
+                                if meds:
+                                    for m in meds:
+                                        st.write(f"• {m.get('drug', '?')} {m.get('dose', '')} {m.get('route', '')} {m.get('frequency', '')}")
                                 else:
                                     st.write("_None identified_")
 
                                 st.markdown("**Procedures**")
-                                procs = resp.get('procedures', [])
-                                if isinstance(procs, list):
+                                if procs:
                                     for p in procs:
                                         st.write(f"• {p}")
-                                elif procs and procs != "None":
-                                    st.write(f"• {procs}")
                                 else:
                                     st.write("_None identified_")
 
                             st.markdown("---")
-                            with st.expander("Raw JSON output"):
+
+                            if obs or dx or meds or procs:
+                                st.markdown("---")
+                                st.markdown("### Terminology Mapping & FHIR Generation")
+
+                                loinc_results = session.sql("""
+                                    SELECT LOINC_CODE, LOINC_DESCRIPTION FROM TRE_HEALTHCARE_DB.TUVA_TEST_OMOP.LOINC_TO_OMOP
+                                """).to_pandas()
+                                rxnorm_results = session.sql("""
+                                    SELECT CONCEPT_CODE, CONCEPT_NAME FROM TUVA_FHIR_TO_OMOP_APP.TERMINOLOGY.CONCEPT
+                                    WHERE VOCABULARY_ID = 'RxNorm'
+                                """).to_pandas()
+                                icd10_results = session.sql("""
+                                    SELECT CONCEPT_CODE, CONCEPT_NAME FROM TUVA_FHIR_TO_OMOP_APP.TERMINOLOGY.CONCEPT
+                                    WHERE VOCABULARY_ID = 'ICD10CM' AND DOMAIN_ID = 'Condition'
+                                """).to_pandas()
+                                snomed_results = session.sql("""
+                                    SELECT CONCEPT_CODE, CONCEPT_NAME FROM TUVA_FHIR_TO_OMOP_APP.TERMINOLOGY.CONCEPT
+                                    WHERE VOCABULARY_ID = 'SNOMED' AND DOMAIN_ID = 'Condition'
+                                """).to_pandas()
+
+                                loinc_lookup = {row['LOINC_DESCRIPTION'].lower(): row['LOINC_CODE'] for _, row in loinc_results.iterrows()}
+                                rxnorm_lookup = {row['CONCEPT_NAME'].lower(): row['CONCEPT_CODE'] for _, row in rxnorm_results.iterrows()}
+                                icd10_lookup = {row['CONCEPT_NAME'].lower(): row['CONCEPT_CODE'] for _, row in icd10_results.iterrows()}
+                                snomed_lookup = {row['CONCEPT_NAME'].lower(): row['CONCEPT_CODE'] for _, row in snomed_results.iterrows()}
+
+                                name_to_loinc = {
+                                    "systolic blood pressure": "8480-6", "diastolic blood pressure": "8462-4",
+                                    "heart rate": "8867-4", "body temperature": "8310-5",
+                                    "respiratory rate": "9279-1", "oxygen saturation": "2708-6",
+                                    "body weight": "29463-7", "body height": "8302-2",
+                                    "body mass index": "39156-5", "bmi": "39156-5",
+                                    "fetal heart rate": "55283-6", "fundal height": "11881-0",
+                                    "hemoglobin": "718-7", "hgb": "718-7",
+                                    "platelets": "777-3", "plts": "777-3",
+                                    "inr": "6301-6", "glucose": "2345-7",
+                                    "creatinine": "2160-0", "potassium": "2823-3",
+                                    "sodium": "2951-2", "protein in urine": "2514-8",
+                                    "urine protein": "2514-8", "white blood cell count": "6690-2",
+                                    "wbc": "6690-2", "weight": "29463-7",
+                                }
+
+                                fhir_bundle = {"resourceType": "Bundle", "type": "collection", "entry": []}
+
+                                obs_mapped = 0
+                                if obs:
+                                    for o in obs:
+                                        name_lower = o.get('name', '').lower()
+                                        loinc_code = name_to_loinc.get(name_lower)
+                                        if not loinc_code:
+                                            for key, code in name_to_loinc.items():
+                                                if key in name_lower or name_lower in key:
+                                                    loinc_code = code
+                                                    break
+                                        if not loinc_code:
+                                            for desc, code in loinc_lookup.items():
+                                                if name_lower in desc or desc in name_lower:
+                                                    loinc_code = code
+                                                    break
+                                        if loinc_code:
+                                            obs_mapped += 1
+                                        fhir_bundle["entry"].append({"resource": {
+                                            "resourceType": "Observation",
+                                            "status": "final",
+                                            "category": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": o.get('category', 'vital-signs')}]}],
+                                            "code": {"coding": [{"system": "http://loinc.org", "code": loinc_code or "UNMAPPED", "display": o.get('name', '')}]},
+                                            "valueQuantity": {"value": o.get('value'), "unit": o.get('unit', '')},
+                                        }})
+
+                                meds_mapped = 0
+                                if meds:
+                                    for m in meds:
+                                        drug_lower = m.get('drug', '').lower()
+                                        rxnorm_code = rxnorm_lookup.get(drug_lower)
+                                        if not rxnorm_code:
+                                            for name, code in rxnorm_lookup.items():
+                                                if name in drug_lower or drug_lower in name:
+                                                    rxnorm_code = code
+                                                    break
+                                        if rxnorm_code:
+                                            meds_mapped += 1
+                                        fhir_bundle["entry"].append({"resource": {
+                                            "resourceType": "MedicationStatement",
+                                            "status": "active",
+                                            "medicationCodeableConcept": {"coding": [{"system": "http://www.nlm.nih.gov/research/umls/rxnorm", "code": rxnorm_code or "UNMAPPED", "display": m.get('drug', '')}]},
+                                            "dosage": [{"text": f"{m.get('dose', '')} {m.get('route', '')} {m.get('frequency', '')}".strip()}],
+                                        }})
+
+                                dx_mapped = 0
+                                if dx:
+                                    for d in dx:
+                                        dx_name = d.get('name', '').lower()
+                                        icd10_code = d.get('icd10')
+                                        snomed_code = None
+                                        if not icd10_code:
+                                            for name, code in icd10_lookup.items():
+                                                if dx_name in name or name in dx_name:
+                                                    icd10_code = code
+                                                    break
+                                        for name, code in snomed_lookup.items():
+                                            if dx_name in name or name in dx_name:
+                                                snomed_code = code
+                                                break
+                                        if icd10_code or snomed_code:
+                                            dx_mapped += 1
+                                        coding = []
+                                        if icd10_code:
+                                            coding.append({"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": icd10_code, "display": d.get('name', '')})
+                                        if snomed_code:
+                                            coding.append({"system": "http://snomed.info/sct", "code": snomed_code, "display": d.get('name', '')})
+                                        if not coding:
+                                            coding.append({"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "UNMAPPED", "display": d.get('name', '')})
+                                        fhir_bundle["entry"].append({"resource": {
+                                            "resourceType": "Condition",
+                                            "clinicalStatus": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-clinical", "code": "active"}]},
+                                            "code": {"coding": coding},
+                                        }})
+
+                                if procs:
+                                    cpt_results = session.sql("""
+                                        SELECT CONCEPT_CODE, CONCEPT_NAME FROM TRE_HEALTHCARE_DB.TUVA_TEST_OMOP.CONCEPT
+                                        WHERE VOCABULARY_ID = 'CPT4'
+                                    """).to_pandas()
+                                    cpt_lookup = {row['CONCEPT_NAME'].lower(): row['CONCEPT_CODE'] for _, row in cpt_results.iterrows()}
+                                    procs_mapped = 0
+                                    for p in procs:
+                                        p_lower = p.lower() if isinstance(p, str) else str(p).lower()
+                                        cpt_code = cpt_lookup.get(p_lower)
+                                        if not cpt_code:
+                                            for name, code in cpt_lookup.items():
+                                                if p_lower in name or name in p_lower:
+                                                    cpt_code = code
+                                                    break
+                                        if cpt_code:
+                                            procs_mapped += 1
+                                        coding = [{"system": "http://www.ama-assn.org/go/cpt", "code": cpt_code or "UNMAPPED", "display": p}]
+                                        fhir_bundle["entry"].append({"resource": {
+                                            "resourceType": "Procedure",
+                                            "status": "completed",
+                                            "code": {"coding": coding},
+                                        }})
+
+                                total_resources = len(fhir_bundle["entry"])
+                                procs_mapped = procs_mapped if procs else 0
+                                total_mapped = obs_mapped + meds_mapped + dx_mapped + procs_mapped
+                                total_mappable = len(obs) + len(meds) + len(dx) + len(procs)
+
+                                c1, c2, c3, c4, c5 = st.columns(5)
+                                c1.metric("FHIR Resources", total_resources)
+                                c2.metric("LOINC", f"{obs_mapped}/{len(obs)}" if obs else "0/0")
+                                c3.metric("RxNorm", f"{meds_mapped}/{len(meds)}" if meds else "0/0")
+                                c4.metric("ICD-10/SNOMED", f"{dx_mapped}/{len(dx)}" if dx else "0/0")
+                                c5.metric("CPT", f"{procs_mapped}/{len(procs)}" if procs else "0/0")
+
+                                if total_mappable > 0:
+                                    pct = int(total_mapped / total_mappable * 100)
+                                    if pct == 100:
+                                        st.success(f"100% terminology coverage — all {total_mappable} items mapped to standard codes")
+                                    elif pct >= 75:
+                                        st.info(f"{pct}% mapped — {total_mappable - total_mapped} items need manual review")
+                                    else:
+                                        st.warning(f"{pct}% mapped — {total_mappable - total_mapped} unmapped items (expand vocabulary or review)")
+
+                                with st.expander(f"FHIR Bundle ({total_resources} resources)"):
+                                    st.json(fhir_bundle)
+
+                            with st.expander("Raw extraction JSON"):
                                 st.json(resp)
 
                             resp_json = json.dumps(resp).replace("'", "''")
@@ -290,13 +460,13 @@ with tab_docs:
 
     with doc_tab_review:
         st.markdown("#### Review & Correct Extractions")
-        st.caption("Select a note with an existing extraction, review the AI output, correct errors, and save.")
+        st.caption("Review AI extractions item by item. Correct errors in names or codes. Before/after pairs are stored for quality scoring.")
         try:
             notes_df = session.sql(f"""
                 SELECT note_id, patient_mrn, note_type, department, extraction_status,
                        LEFT(note_text, 80) || '...' as preview
                 FROM {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
-                WHERE extraction_status = 'EXTRACTED'
+                WHERE extraction_status IN ('EXTRACTED', 'REVIEWED')
                 ORDER BY created_at DESC
                 LIMIT 20
             """).to_pandas()
@@ -306,50 +476,223 @@ with tab_docs:
                     format_func=lambda i: f"#{notes_df.iloc[i]['NOTE_ID']} — {notes_df.iloc[i]['NOTE_TYPE']} ({notes_df.iloc[i]['DEPARTMENT']}) — {notes_df.iloc[i]['PREVIEW']}",
                     key="doc_review_select")
 
+                note_id = notes_df.iloc[selected_note]['NOTE_ID']
                 note_row = session.sql(f"""
                     SELECT note_text, extraction_json::STRING as extraction_json
                     FROM {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
-                    WHERE note_id = {notes_df.iloc[selected_note]['NOTE_ID']}
+                    WHERE note_id = {note_id}
                 """).collect()
 
                 if note_row and note_row[0]['EXTRACTION_JSON']:
-                    col_note, col_extract = st.columns(2)
+                    extraction = json.loads(note_row[0]['EXTRACTION_JSON'])
+
+                    loinc_df = session.sql("SELECT LOINC_CODE, LOINC_DESCRIPTION FROM TRE_HEALTHCARE_DB.TUVA_TEST_OMOP.LOINC_TO_OMOP").to_pandas()
+                    rxnorm_df = session.sql("SELECT CONCEPT_CODE, CONCEPT_NAME FROM TUVA_FHIR_TO_OMOP_APP.TERMINOLOGY.CONCEPT WHERE VOCABULARY_ID = 'RxNorm'").to_pandas()
+                    icd10_df = session.sql("SELECT CONCEPT_CODE, CONCEPT_NAME FROM TUVA_FHIR_TO_OMOP_APP.TERMINOLOGY.CONCEPT WHERE VOCABULARY_ID = 'ICD10CM' AND DOMAIN_ID = 'Condition'").to_pandas()
+                    cpt_df = session.sql("SELECT CONCEPT_CODE, CONCEPT_NAME FROM TRE_HEALTHCARE_DB.TUVA_TEST_OMOP.CONCEPT WHERE VOCABULARY_ID = 'CPT4'").to_pandas()
+
+                    loinc_lookup = {row['LOINC_DESCRIPTION'].lower(): row['LOINC_CODE'] for _, row in loinc_df.iterrows()}
+                    rxnorm_lookup = {row['CONCEPT_NAME'].lower(): row['CONCEPT_CODE'] for _, row in rxnorm_df.iterrows()}
+                    icd10_lookup = {row['CONCEPT_NAME'].lower(): row['CONCEPT_CODE'] for _, row in icd10_df.iterrows()}
+                    cpt_lookup = {row['CONCEPT_NAME'].lower(): row['CONCEPT_CODE'] for _, row in cpt_df.iterrows()}
+
+                    name_to_loinc = {
+                        "systolic blood pressure": "8480-6", "diastolic blood pressure": "8462-4",
+                        "heart rate": "8867-4", "body temperature": "8310-5",
+                        "respiratory rate": "9279-1", "oxygen saturation": "2708-6",
+                        "body weight": "29463-7", "weight": "29463-7", "body height": "8302-2",
+                        "body mass index": "39156-5", "bmi": "39156-5",
+                        "fetal heart rate": "55283-6", "fundal height": "11881-0",
+                        "hemoglobin": "718-7", "hgb": "718-7", "platelets": "777-3", "plts": "777-3",
+                        "inr": "6301-6", "glucose": "2345-7", "creatinine": "2160-0",
+                        "potassium": "2823-3", "sodium": "2951-2",
+                        "protein in urine": "2514-8", "urine protein": "2514-8",
+                        "white blood cell count": "6690-2", "wbc": "6690-2",
+                    }
+
+                    def resolve_loinc(name):
+                        n = name.lower()
+                        code = name_to_loinc.get(n)
+                        if not code:
+                            for key, c in name_to_loinc.items():
+                                if key in n or n in key:
+                                    code = c
+                                    break
+                        if not code:
+                            for desc, c in loinc_lookup.items():
+                                if n in desc or desc in n:
+                                    code = c
+                                    break
+                        return code or ""
+
+                    def resolve_rxnorm(drug):
+                        d = drug.lower()
+                        code = rxnorm_lookup.get(d)
+                        if not code:
+                            for name, c in rxnorm_lookup.items():
+                                if name in d or d in name:
+                                    code = c
+                                    break
+                        return code or ""
+
+                    def resolve_icd10(dx):
+                        d = dx.lower()
+                        for name, c in icd10_lookup.items():
+                            if d in name or name in d:
+                                return c
+                        return ""
+
+                    def resolve_cpt(proc):
+                        p = proc.lower()
+                        code = cpt_lookup.get(p)
+                        if not code:
+                            for name, c in cpt_lookup.items():
+                                if p in name or name in p:
+                                    code = c
+                                    break
+                        return code or ""
+
+                    col_note, col_review = st.columns([1, 2])
                     with col_note:
                         st.markdown("**Original Note**")
-                        st.text_area("", value=note_row[0]['NOTE_TEXT'], height=400, disabled=True, key="doc_review_note_text")
+                        st.text_area("", value=note_row[0]['NOTE_TEXT'], height=500, disabled=True, key="doc_review_note_text")
 
-                    with col_extract:
-                        st.markdown("**AI Extraction — Edit below to correct**")
-                        extraction = json.loads(note_row[0]['EXTRACTION_JSON'])
+                    with col_review:
+                        st.markdown("**Extracted Items — Edit to correct**")
 
-                        def list_to_text(val):
-                            if isinstance(val, list):
-                                return "\n".join(str(v) for v in val)
-                            return str(val) if val else ""
+                        corrections_made = []
 
-                        dx_text = st.text_area("Diagnoses (one per line)", value=list_to_text(extraction.get('diagnoses', [])), height=100, key="doc_review_dx")
-                        meds_text = st.text_area("Medications (one per line)", value=list_to_text(extraction.get('medications', [])), height=100, key="doc_review_meds")
-                        vitals_text = st.text_area("Vital Signs (one per line)", value=list_to_text(extraction.get('vital_signs', [])), height=80, key="doc_review_vitals")
-                        labs_text = st.text_area("Lab Values (one per line)", value=list_to_text(extraction.get('lab_values', [])), height=80, key="doc_review_labs")
-                        procs_text = st.text_area("Procedures (one per line)", value=list_to_text(extraction.get('procedures', [])), height=80, key="doc_review_procs")
+                        obs = extraction.get('observations', [])
+                        if obs:
+                            st.markdown("##### Observations (LOINC)")
+                            for i, o in enumerate(obs):
+                                with st.container():
+                                    c1, c2, c3 = st.columns([2, 1, 1])
+                                    orig_name = o.get('name', '')
+                                    orig_val = str(o.get('value', ''))
+                                    resolved_code = resolve_loinc(orig_name)
+                                    with c1:
+                                        new_name = st.text_input(f"Name", value=orig_name, key=f"obs_name_{i}")
+                                    with c2:
+                                        new_val = st.text_input(f"Value", value=orig_val, key=f"obs_val_{i}")
+                                    with c3:
+                                        new_code = st.text_input(f"LOINC", value=resolved_code, key=f"obs_code_{i}")
+                                    if new_name != orig_name or new_code != resolved_code:
+                                        corrections_made.append({
+                                            "resource_type": "Observation",
+                                            "field_path": f"observations[{i}]",
+                                            "original_value": orig_name,
+                                            "original_code": resolved_code,
+                                            "corrected_value": new_name if new_name != orig_name else orig_name,
+                                            "corrected_code": new_code if new_code != resolved_code else resolved_code,
+                                        })
+
+                        meds = extraction.get('medications', [])
+                        if meds:
+                            st.markdown("##### Medications (RxNorm)")
+                            for i, m in enumerate(meds):
+                                orig_drug = m.get('drug', '') if isinstance(m, dict) else str(m)
+                                resolved_code = resolve_rxnorm(orig_drug)
+                                c1, c2 = st.columns([2, 1])
+                                with c1:
+                                    new_drug = st.text_input(f"Drug", value=orig_drug, key=f"med_name_{i}")
+                                with c2:
+                                    new_code = st.text_input(f"RxNorm", value=resolved_code, key=f"med_code_{i}")
+                                if new_drug != orig_drug or new_code != resolved_code:
+                                    corrections_made.append({
+                                        "resource_type": "MedicationStatement",
+                                        "field_path": f"medications[{i}]",
+                                        "original_value": orig_drug,
+                                        "original_code": resolved_code,
+                                        "corrected_value": new_drug if new_drug != orig_drug else orig_drug,
+                                        "corrected_code": new_code if new_code != resolved_code else resolved_code,
+                                    })
+
+                        dx = extraction.get('diagnoses', [])
+                        if dx:
+                            st.markdown("##### Diagnoses (ICD-10 / SNOMED)")
+                            for i, d in enumerate(dx):
+                                orig_dx = d.get('name', '') if isinstance(d, dict) else str(d)
+                                orig_icd = d.get('icd10', '') if isinstance(d, dict) else ''
+                                resolved_code = orig_icd or resolve_icd10(orig_dx)
+                                c1, c2 = st.columns([2, 1])
+                                with c1:
+                                    new_dx = st.text_input(f"Diagnosis", value=orig_dx, key=f"dx_name_{i}")
+                                with c2:
+                                    new_code = st.text_input(f"ICD-10", value=resolved_code, key=f"dx_code_{i}")
+                                if new_dx != orig_dx or new_code != resolved_code:
+                                    corrections_made.append({
+                                        "resource_type": "Condition",
+                                        "field_path": f"diagnoses[{i}]",
+                                        "original_value": orig_dx,
+                                        "original_code": resolved_code,
+                                        "corrected_value": new_dx if new_dx != orig_dx else orig_dx,
+                                        "corrected_code": new_code if new_code != resolved_code else resolved_code,
+                                    })
+
+                        procs = extraction.get('procedures', [])
+                        if procs:
+                            st.markdown("##### Procedures (CPT)")
+                            for i, p in enumerate(procs):
+                                orig_proc = p if isinstance(p, str) else str(p)
+                                resolved_code = resolve_cpt(orig_proc)
+                                c1, c2 = st.columns([2, 1])
+                                with c1:
+                                    new_proc = st.text_input(f"Procedure", value=orig_proc, key=f"proc_name_{i}")
+                                with c2:
+                                    new_code = st.text_input(f"CPT", value=resolved_code, key=f"proc_code_{i}")
+                                if new_proc != orig_proc or new_code != resolved_code:
+                                    corrections_made.append({
+                                        "resource_type": "Procedure",
+                                        "field_path": f"procedures[{i}]",
+                                        "original_value": orig_proc,
+                                        "original_code": resolved_code,
+                                        "corrected_value": new_proc if new_proc != orig_proc else orig_proc,
+                                        "corrected_code": new_code if new_code != resolved_code else resolved_code,
+                                    })
+
+                        st.markdown("---")
+                        if corrections_made:
+                            st.info(f"{len(corrections_made)} correction(s) pending")
+
+                        reason = st.text_input("Correction reason (optional)", key="doc_review_reason", placeholder="e.g. Wrong drug mapped, AI hallucinated diagnosis")
 
                         if st.button("Save Corrections", key="doc_review_save", type="primary"):
-                            corrected = {
-                                "diagnoses": [x.strip() for x in dx_text.split("\n") if x.strip()],
-                                "medications": [x.strip() for x in meds_text.split("\n") if x.strip()],
-                                "vital_signs": [x.strip() for x in vitals_text.split("\n") if x.strip()],
-                                "lab_values": [x.strip() for x in labs_text.split("\n") if x.strip()],
-                                "procedures": [x.strip() for x in procs_text.split("\n") if x.strip()],
-                            }
-                            corrected_json = json.dumps(corrected).replace("'", "''")
-                            session.sql(f"""
-                                UPDATE {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
-                                SET extraction_json = PARSE_JSON('{corrected_json}'),
-                                    extraction_status = 'REVIEWED',
-                                    reviewed_at = CURRENT_TIMESTAMP()
-                                WHERE note_id = {notes_df.iloc[selected_note]['NOTE_ID']}
-                            """).collect()
-                            st.success("Corrections saved!")
+                            if corrections_made:
+                                for c in corrections_made:
+                                    reason_escaped = reason.replace("'", "''") if reason else ""
+                                    session.sql(f"""
+                                        INSERT INTO {DOC_DB}.{DOC_SCHEMA}.EXTRACTION_CORRECTIONS
+                                        (note_id, resource_type, field_path, original_value, original_code, corrected_value, corrected_code, correction_reason)
+                                        VALUES ({note_id}, '{c["resource_type"]}', '{c["field_path"]}',
+                                                '{c["original_value"].replace("'", "''")}', '{c["original_code"]}',
+                                                '{c["corrected_value"].replace("'", "''")}', '{c["corrected_code"]}',
+                                                '{reason_escaped}')
+                                    """).collect()
+                                session.sql(f"""
+                                    UPDATE {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
+                                    SET extraction_status = 'REVIEWED', reviewed_at = CURRENT_TIMESTAMP()
+                                    WHERE note_id = {note_id}
+                                """).collect()
+                                st.success(f"Saved {len(corrections_made)} correction(s) with before/after pairs!")
+                            else:
+                                session.sql(f"""
+                                    UPDATE {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
+                                    SET extraction_status = 'REVIEWED', reviewed_at = CURRENT_TIMESTAMP()
+                                    WHERE note_id = {note_id}
+                                """).collect()
+                                st.success("Marked as reviewed (no corrections needed)")
+
+                        existing_corrections = session.sql(f"""
+                            SELECT resource_type, field_path, original_value, original_code, corrected_value, corrected_code, correction_reason, corrected_at
+                            FROM {DOC_DB}.{DOC_SCHEMA}.EXTRACTION_CORRECTIONS
+                            WHERE note_id = {note_id}
+                            ORDER BY corrected_at DESC
+                        """).to_pandas()
+                        if not existing_corrections.empty:
+                            with st.expander(f"Previous corrections ({len(existing_corrections)})"):
+                                st.dataframe(existing_corrections, use_container_width=True)
+
                 elif note_row:
                     st.info("This note hasn't been extracted yet. Go to Upload & Extract → Select existing → Extract first.")
             else:
@@ -358,25 +701,79 @@ with tab_docs:
             st.warning(f"Could not load notes: {str(e)[:200]}")
 
     with doc_tab_history:
-        st.markdown("#### Extraction History & Metrics")
+        st.markdown("#### Extraction History & Quality Metrics")
         try:
             stats = session.sql(f"""
                 SELECT
                     COUNT(*) as total_notes,
                     COUNT(DISTINCT department) as departments,
-                    COUNT(DISTINCT note_type) as note_types
+                    COUNT(DISTINCT note_type) as note_types,
+                    SUM(CASE WHEN extraction_status = 'EXTRACTED' THEN 1 ELSE 0 END) as extracted,
+                    SUM(CASE WHEN extraction_status = 'REVIEWED' THEN 1 ELSE 0 END) as reviewed,
+                    SUM(CASE WHEN extraction_status = 'PENDING' OR extraction_status IS NULL THEN 1 ELSE 0 END) as pending
                 FROM {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
             """).collect()
             if stats:
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4, c5, c6 = st.columns(6)
                 c1.metric("Total Notes", stats[0]['TOTAL_NOTES'])
-                c2.metric("Departments", stats[0]['DEPARTMENTS'])
-                c3.metric("Note Types", stats[0]['NOTE_TYPES'])
+                c2.metric("Pending", stats[0]['PENDING'])
+                c3.metric("Extracted", stats[0]['EXTRACTED'])
+                c4.metric("Reviewed", stats[0]['REVIEWED'])
+                c5.metric("Departments", stats[0]['DEPARTMENTS'])
+                c6.metric("Note Types", stats[0]['NOTE_TYPES'])
 
+            st.markdown("---")
+            st.markdown("##### Correction Quality Scores")
+
+            correction_stats = session.sql(f"""
+                SELECT
+                    COUNT(*) as total_corrections,
+                    COUNT(DISTINCT note_id) as notes_with_corrections,
+                    COUNT(CASE WHEN resource_type = 'Observation' THEN 1 END) as obs_corrections,
+                    COUNT(CASE WHEN resource_type = 'MedicationStatement' THEN 1 END) as med_corrections,
+                    COUNT(CASE WHEN resource_type = 'Condition' THEN 1 END) as dx_corrections,
+                    COUNT(CASE WHEN resource_type = 'Procedure' THEN 1 END) as proc_corrections
+                FROM {DOC_DB}.{DOC_SCHEMA}.EXTRACTION_CORRECTIONS
+            """).collect()
+
+            if correction_stats and correction_stats[0]['TOTAL_CORRECTIONS'] > 0:
+                cs = correction_stats[0]
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Total Corrections", cs['TOTAL_CORRECTIONS'])
+                c2.metric("Observation Fixes", cs['OBS_CORRECTIONS'])
+                c3.metric("Medication Fixes", cs['MED_CORRECTIONS'])
+                c4.metric("Diagnosis Fixes", cs['DX_CORRECTIONS'])
+                c5.metric("Procedure Fixes", cs['PROC_CORRECTIONS'])
+
+                reviewed_count = stats[0]['REVIEWED'] if stats else 0
+                extracted_count = stats[0]['EXTRACTED'] if stats else 0
+                total_processed = reviewed_count + extracted_count
+                if total_processed > 0:
+                    notes_needing_correction = cs['NOTES_WITH_CORRECTIONS']
+                    accuracy_pct = int((1 - notes_needing_correction / total_processed) * 100) if total_processed > 0 else 0
+                    st.metric("AI Extraction Accuracy (notes needing zero corrections)", f"{accuracy_pct}%")
+
+                st.markdown("##### Recent Corrections")
+                recent = session.sql(f"""
+                    SELECT c.note_id, n.note_type, c.resource_type, c.field_path,
+                           c.original_value, c.original_code, c.corrected_value, c.corrected_code,
+                           c.correction_reason, c.corrected_at
+                    FROM {DOC_DB}.{DOC_SCHEMA}.EXTRACTION_CORRECTIONS c
+                    JOIN {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES n ON c.note_id = n.note_id
+                    ORDER BY c.corrected_at DESC
+                    LIMIT 20
+                """).to_pandas()
+                if not recent.empty:
+                    st.dataframe(recent, use_container_width=True)
+            else:
+                st.info("No corrections recorded yet. Review some extracted notes to build quality data.")
+
+            st.markdown("---")
+            st.markdown("##### Notes by Department & Type")
             by_dept = session.sql(f"""
-                SELECT department, note_type, COUNT(*) as cnt
+                SELECT department, note_type, extraction_status, COUNT(*) as cnt
                 FROM {DOC_DB}.{DOC_SCHEMA}.CLINICAL_NOTES
-                GROUP BY department, note_type
+                GROUP BY department, note_type, extraction_status
                 ORDER BY cnt DESC
             """).to_pandas()
             if not by_dept.empty:
